@@ -1,0 +1,13 @@
+.pio
+.vscode
+sdkconfig
+sdkconfig.old
+MINECRAFT_SERVER_PLAN.md
+
+# Secrets - never commit
+include/secrets.h
+
+# PlatformIO READMEs
+include/README
+lib/README
+test/README
