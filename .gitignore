@@ -11,3 +11,7 @@ include/secrets.h
 include/README
 lib/README
 test/README
+
+# Test scripts
+test_handshake.py
+sdkconfig.seeed_xiao_esp32s3

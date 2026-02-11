@@ -54,7 +54,7 @@ static void wifi_init()
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "WiFi init done, connecting to \"%s\"...", WIFI_SSID);
+    ESP_LOGI(TAG, "WiFi init done, connecting to \"%s\"", WIFI_SSID);
 }
 
 static void tcp_server_task(void* pvParameters)
@@ -112,7 +112,6 @@ static void tcp_server_task(void* pvParameters)
         int nodelay = 1;
         setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-        // For now: read and hex-dump incoming data
         uint8_t buf[256];
         while (true) {
             int len = recv(client_sock, buf, sizeof(buf), 0);
