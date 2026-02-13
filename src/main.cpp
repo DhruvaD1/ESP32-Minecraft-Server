@@ -1,4 +1,6 @@
 #include <cstring>
+#include <cstdio>
+#include <cmath>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -11,8 +13,14 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "config.h"
+#include "mc_types.h"
+#include "mc_packet.h"
+#include "mc_registry.h"
+#include "mc_play.h"
 
 static constexpr const char* TAG = "mc_server";
+
+enum class ConnState { HANDSHAKE, STATUS, LOGIN, CONFIG, PLAY };
 
 static volatile bool wifi_connected = false;
 
@@ -55,6 +63,158 @@ static void wifi_init()
     ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_LOGI(TAG, "WiFi init done, connecting to \"%s\"", WIFI_SSID);
+}
+
+static void send_status_response(int sock, PacketBuf& out) {
+    char json[256];
+    snprintf(json, sizeof(json),
+        "{\"version\":{\"name\":\"%s\",\"protocol\":%d},"
+        "\"players\":{\"max\":%d,\"online\":0},"
+        "\"description\":{\"text\":\"ESP32-S3 Minecraft Server\"}}",
+        MC_VERSION_NAME, MC_PROTOCOL_VERSION, MC_MAX_PLAYERS);
+
+    out.reset();
+    pkt_write_varint(out, 0x00);
+    pkt_write_string(out, json);
+    out.send_packet(sock);
+}
+
+static void send_pong(int sock, PacketBuf& out, int64_t payload) {
+    out.reset();
+    pkt_write_varint(out, 0x01);
+    pkt_write_i64(out, payload);
+    out.send_packet(sock);
+}
+
+static void handle_client(int sock) {
+    PacketBuf in, out;
+    in.init();
+    out.init();
+
+    ConnState state = ConnState::HANDSHAKE;
+
+    while (in.recv_packet(sock)) {
+        int32_t packet_id = pkt_read_varint(in);
+
+        if (state == ConnState::HANDSHAKE && packet_id == 0x00) {
+            int32_t proto_ver = pkt_read_varint(in);
+            char server_addr[256];
+            pkt_read_string(in, server_addr, sizeof(server_addr));
+            uint16_t server_port = pkt_read_u16(in);
+            int32_t next_state = pkt_read_varint(in);
+
+            ESP_LOGI(TAG, "Handshake: proto=%d addr=%s port=%d next=%d",
+                     proto_ver, server_addr, server_port, next_state);
+
+            if (next_state == 1) state = ConnState::STATUS;
+            else if (next_state == 2) state = ConnState::LOGIN;
+            continue;
+        }
+
+        if (state == ConnState::STATUS) {
+            if (packet_id == 0x00) {
+                ESP_LOGI(TAG, "Status request -> sending response");
+                send_status_response(sock, out);
+            } else if (packet_id == 0x01) {
+                int64_t payload = pkt_read_i64(in);
+                ESP_LOGI(TAG, "Ping -> pong");
+                send_pong(sock, out, payload);
+                break;
+            }
+            continue;
+        }
+
+        if (state == ConnState::LOGIN) {
+            if (packet_id == 0x00) {
+                char username[17];
+                pkt_read_string(in, username, sizeof(username));
+                uint64_t uuid_hi, uuid_lo;
+                pkt_read_uuid(in, uuid_hi, uuid_lo);
+
+                ESP_LOGI(TAG, "Login Start: user=%s", username);
+
+                out.reset();
+                pkt_write_varint(out, 0x02);
+                pkt_write_uuid(out, uuid_hi, uuid_lo);
+                pkt_write_string(out, username);
+                pkt_write_varint(out, 0);
+                out.send_packet(sock);
+
+                ESP_LOGI(TAG, "Sent Login Success, waiting for ack");
+            } else if (packet_id == 0x03) {
+                ESP_LOGI(TAG, "Login Acknowledged -> Configuration state");
+                state = ConnState::CONFIG;
+                send_config_packets(sock, out);
+            }
+            continue;
+        }
+
+        if (state == ConnState::CONFIG) {
+            if (packet_id == 0x03) {
+                ESP_LOGI(TAG, "Client acknowledged config -> Play state");
+                state = ConnState::PLAY;
+                send_play_packets(sock, out);
+                break;
+            }
+            continue;
+        }
+    }
+
+    if (state == ConnState::PLAY) {
+        int center_cx = 0, center_cz = 0;
+        TickType_t last_ka = xTaskGetTickCount();
+        PacketBuf scratch;
+        scratch.init(8192);
+
+        while (true) {
+            fd_set fds;
+            FD_ZERO(&fds);
+            FD_SET(sock, &fds);
+            struct timeval tv = {1, 0};
+            int ret = select(sock + 1, &fds, nullptr, nullptr, &tv);
+
+            if (ret > 0) {
+                if (!in.recv_packet(sock)) break;
+                int32_t pkt_id = pkt_read_varint(in);
+
+                if (pkt_id == 0x1c || pkt_id == 0x1d) {
+                    double px = pkt_read_f64(in);
+                    pkt_read_f64(in);
+                    double pz = pkt_read_f64(in);
+                    int new_cx = static_cast<int>(floor(px)) >> 4;
+                    int new_cz = static_cast<int>(floor(pz)) >> 4;
+
+                    if (new_cx != center_cx || new_cz != center_cz) {
+                        int old_cx = center_cx, old_cz = center_cz;
+                        center_cx = new_cx;
+                        center_cz = new_cz;
+                        send_center_chunk(sock, out, new_cx, new_cz);
+                        int vd = MC_VIEW_DISTANCE;
+                        for (int cx = new_cx - vd; cx <= new_cx + vd; cx++)
+                            for (int cz = new_cz - vd; cz <= new_cz + vd; cz++)
+                                if (abs(cx - old_cx) > vd || abs(cz - old_cz) > vd)
+                                    send_chunk(sock, out, scratch, cx, cz);
+                    }
+                }
+            } else if (ret < 0) {
+                break;
+            }
+
+            TickType_t now = xTaskGetTickCount();
+            if ((now - last_ka) * portTICK_PERIOD_MS >= 10000) {
+                out.reset();
+                pkt_write_varint(out, 0x27);
+                pkt_write_i64(out, static_cast<int64_t>(now));
+                if (!out.send_packet(sock)) break;
+                last_ka = now;
+            }
+        }
+
+        scratch.free();
+    }
+
+    in.free();
+    out.free();
 }
 
 static void tcp_server_task(void* pvParameters)
@@ -112,26 +272,7 @@ static void tcp_server_task(void* pvParameters)
         int nodelay = 1;
         setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-        uint8_t buf[256];
-        while (true) {
-            int len = recv(client_sock, buf, sizeof(buf), 0);
-            if (len <= 0) {
-                if (len == 0) {
-                    ESP_LOGI(TAG, "Client disconnected");
-                } else {
-                    ESP_LOGE(TAG, "Recv error: errno %d", errno);
-                }
-                break;
-            }
-
-            char hex[32 * 3 + 1];
-            int dump_len = len < 32 ? len : 32;
-            for (int i = 0; i < dump_len; i++) {
-                sprintf(hex + i * 3, "%02x ", buf[i]);
-            }
-            hex[dump_len * 3] = '\0';
-            ESP_LOGI(TAG, "Received %d bytes: %s%s", len, hex, len > 32 ? "." : "");
-        }
+        handle_client(client_sock);
 
         close(client_sock);
         ESP_LOGI(TAG, "Connection closed");
@@ -160,5 +301,5 @@ extern "C" void app_main()
 
     wifi_init();
 
-    xTaskCreatePinnedToCore(tcp_server_task, "tcp_server", 8192, nullptr, 5, nullptr, 0);
+    xTaskCreatePinnedToCore(tcp_server_task, "tcp_server", 32768, nullptr, 5, nullptr, 0);
 }
