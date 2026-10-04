@@ -4,11 +4,15 @@
 #include "lwip/sockets.h"
 
 int mc_read_varint(const uint8_t* buf, size_t buf_len, int32_t& out_value) {
-    out_value = 0;
+    uint32_t v = 0;
     int shift = 0;
+    out_value = 0;
     for (size_t i = 0; i < buf_len && i < 5; i++) {
-        out_value |= (static_cast<int32_t>(buf[i] & 0x7F)) << shift;
-        if ((buf[i] & 0x80) == 0) return i + 1;
+        v |= static_cast<uint32_t>(buf[i] & 0x7F) << shift;
+        if ((buf[i] & 0x80) == 0) {
+            out_value = static_cast<int32_t>(v);
+            return i + 1;
+        }
         shift += 7;
     }
     return -1;
@@ -34,14 +38,18 @@ int mc_varint_size(int32_t value) {
 }
 
 int mc_read_varint_sock(int sock, int32_t& out_value) {
-    out_value = 0;
+    uint32_t v = 0;
     int shift = 0;
+    out_value = 0;
     for (int i = 0; i < 5; i++) {
         uint8_t b;
         int r = recv(sock, &b, 1, 0);
         if (r <= 0) return -1;
-        out_value |= (static_cast<int32_t>(b & 0x7F)) << shift;
-        if ((b & 0x80) == 0) return i + 1;
+        v |= static_cast<uint32_t>(b & 0x7F) << shift;
+        if ((b & 0x80) == 0) {
+            out_value = static_cast<int32_t>(v);
+            return i + 1;
+        }
         shift += 7;
     }
     return -1;
@@ -62,8 +70,8 @@ int32_t mc_read_i32(const uint8_t* buf) {
 }
 
 int64_t mc_read_i64(const uint8_t* buf) {
-    return (static_cast<int64_t>(mc_read_i32(buf)) << 32) |
-           (static_cast<uint32_t>(mc_read_i32(buf + 4)));
+    return static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(mc_read_i32(buf))) << 32) |
+                                static_cast<uint32_t>(mc_read_i32(buf + 4)));
 }
 
 float mc_read_f32(const uint8_t* buf) {
@@ -165,35 +173,64 @@ void pkt_write_uuid(PacketBuf& b, uint64_t hi, uint64_t lo) {
     pkt_write_i64(b, static_cast<int64_t>(lo));
 }
 
-uint8_t pkt_read_byte(PacketBuf& b) { return b.data[b.pos++]; }
+// Every read checks the bytes are there first. On a short packet it sets
+// b.err and returns zero, so callers check in.err once after parsing.
+static bool take(PacketBuf& b, size_t n) {
+    if (b.err || b.len - b.pos < n) {
+        b.err = true;
+        b.pos = b.len;
+        return false;
+    }
+    return true;
+}
+
+uint8_t pkt_read_byte(PacketBuf& b) {
+    if (!take(b, 1)) return 0;
+    return b.data[b.pos++];
+}
 bool pkt_read_bool(PacketBuf& b) { return pkt_read_byte(b) != 0; }
 
 uint16_t pkt_read_u16(PacketBuf& b) {
+    if (!take(b, 2)) return 0;
     uint16_t v = mc_read_u16(b.data + b.pos); b.pos += 2; return v;
 }
 int16_t pkt_read_i16(PacketBuf& b) {
+    if (!take(b, 2)) return 0;
     int16_t v = mc_read_i16(b.data + b.pos); b.pos += 2; return v;
 }
 int32_t pkt_read_i32(PacketBuf& b) {
+    if (!take(b, 4)) return 0;
     int32_t v = mc_read_i32(b.data + b.pos); b.pos += 4; return v;
 }
 int64_t pkt_read_i64(PacketBuf& b) {
+    if (!take(b, 8)) return 0;
     int64_t v = mc_read_i64(b.data + b.pos); b.pos += 8; return v;
 }
 float pkt_read_f32(PacketBuf& b) {
+    if (!take(b, 4)) return 0.0f;
     float v = mc_read_f32(b.data + b.pos); b.pos += 4; return v;
 }
 double pkt_read_f64(PacketBuf& b) {
+    if (!take(b, 8)) return 0.0;
     double v = mc_read_f64(b.data + b.pos); b.pos += 8; return v;
 }
 int32_t pkt_read_varint(PacketBuf& b) {
+    if (b.err) return 0;
     int32_t val;
     int n = mc_read_varint(b.data + b.pos, b.len - b.pos, val);
-    if (n > 0) b.pos += n;
+    if (n < 0) {
+        b.err = true;
+        b.pos = b.len;
+        return 0;
+    }
+    b.pos += n;
     return val;
 }
 size_t pkt_read_string(PacketBuf& b, char* out, size_t max_len) {
+    if (max_len == 0) return 0;
+    out[0] = '\0';
     int32_t slen = pkt_read_varint(b);
+    if (b.err || slen < 0 || !take(b, static_cast<size_t>(slen))) return 0;
     size_t copy = (static_cast<size_t>(slen) < max_len - 1) ? slen : max_len - 1;
     std::memcpy(out, b.data + b.pos, copy);
     out[copy] = '\0';

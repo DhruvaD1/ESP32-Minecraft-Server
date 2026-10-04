@@ -1,6 +1,7 @@
 #include "mc_registry.h"
 #include "mc_types.h"
 #include "mc_nbt.h"
+#include "mc_world.h"
 #include "esp_log.h"
 #include <cstring>
 
@@ -103,24 +104,26 @@ static void send_biome(int sock, PacketBuf& out) {
     out.reset();
     pkt_write_varint(out, 0x07);
     pkt_write_string(out, "minecraft:worldgen/biome");
-    pkt_write_varint(out, 1);
+    pkt_write_varint(out, BIOME_COUNT);
 
-    pkt_write_string(out, "minecraft:plains");
-    pkt_write_bool(out, true);
-    nbt_begin(out);
-    nbt_byte(out, "has_precipitation", 1);
-    nbt_float(out, "temperature", 0.8f);
-    nbt_float(out, "downfall", 0.4f);
-    nbt_compound(out, "effects");
-    nbt_int(out, "sky_color", 7907327);
-    nbt_int(out, "fog_color", 12638463);
-    nbt_int(out, "water_color", 4159204);
-    nbt_int(out, "water_fog_color", 329011);
-    nbt_end(out);
-    nbt_end(out);
+    for (int i = 0; i < BIOME_COUNT; i++) {
+        pkt_write_string(out, BIOMES[i].id);
+        pkt_write_bool(out, true);
+        nbt_begin(out);
+        nbt_byte(out, "has_precipitation", 1);
+        nbt_float(out, "temperature", BIOMES[i].temperature);
+        nbt_float(out, "downfall", BIOMES[i].downfall);
+        nbt_compound(out, "effects");
+        nbt_int(out, "sky_color", BIOMES[i].sky_color);
+        nbt_int(out, "fog_color", 12638463);
+        nbt_int(out, "water_color", 4159204);
+        nbt_int(out, "water_fog_color", 329011);
+        nbt_end(out);
+        nbt_end(out);
+    }
 
     out.send_packet(sock);
-    ESP_LOGI(TAG, "Sent biome");
+    ESP_LOGI(TAG, "Sent %d biomes", BIOME_COUNT);
 }
 
 static void send_chat_type(int sock, PacketBuf& out) {

@@ -10,15 +10,21 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # lwIP - increase socket/connection limits
-CONFIG_LWIP_MAX_SOCKETS=8
+CONFIG_LWIP_MAX_SOCKETS=12
 CONFIG_LWIP_TCP_MSS=1460
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5744
 CONFIG_LWIP_TCP_WND_DEFAULT=5744
 CONFIG_LWIP_SO_REUSE=y
+# TIME_WAIT is 2 x MSL. lwIP drops a reconnect from a port still in TIME_WAIT,
+# so keep it to 2s instead of 2 minutes (fine on a LAN).
+CONFIG_LWIP_TCP_MSL=1000
 
 # WiFi
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=12
+# Copy received frames out of the WiFi buffers. Otherwise unread socket data pins
+# them, and with 5 busy players they all fill up and the link deadlocks.
+CONFIG_LWIP_L2_TO_L3_COPY=y
 
 # FreeRTOS
 CONFIG_FREERTOS_HZ=1000
@@ -26,3 +32,6 @@ CONFIG_FREERTOS_HZ=1000
 # Logging
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_DEFAULT_LEVEL=3
+
+# XIAO ESP32-S3 has 8MB flash (the app partition needs more than 2MB)
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
