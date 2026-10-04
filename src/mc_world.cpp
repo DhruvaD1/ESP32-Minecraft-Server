@@ -1,28 +1,18 @@
 #include "mc_world.h"
 #include "mc_types.h"
 #include "mc_nbt.h"
-#include "esp_heap_caps.h"
+#include "mc_protocol.h"
+#include <algorithm>
 #include <cmath>
-#include <cstring>
+#include <cstdlib>
 
-const BiomeInfo BIOMES[BIOME_COUNT] = {
-    {"minecraft:plains",          0.8f,  0.4f, 7907327},
-    {"minecraft:taiga",           0.25f, 0.8f, 8233983},
-    {"minecraft:ocean",           0.5f,  0.5f, 8103167},
-    {"minecraft:windswept_hills", 0.2f,  0.3f, 8233727},
-};
-
-enum : uint8_t {
-    B_AIR, B_STONE, B_DIRT, B_GRASS, B_WATER, B_OAK_LOG, B_OAK_LEAVES, B_SHORT_GRASS,
-    B_SAND, B_SPRUCE_LOG, B_SPRUCE_LEAVES, B_FERN, B_PODZOL, B_GRAVEL, B_SNOW,
-    B_PALETTE_SIZE
-};
-
-// 1.21.4 block state ids. Grass/podzol are snowy=false, leaves are
+// 1.21.4 block state ids, indexed by Block. Grass/podzol are snowy=false, leaves are
 // distance=1,persistent=true,waterlogged=false, logs are axis=y.
-static const int32_t PALETTE[B_PALETTE_SIZE] = {
+static constexpr auto PALETTE = std::to_array<int32_t>({
     0, 1, 10, 9, 86, 137, 253, 2048, 118, 140, 281, 2049, 13, 124, 5950,
-};
+});
+static_assert(PALETTE.size() == std::to_underlying(Block::Snow) + 1);
+static_assert(PALETTE.size() <= 16, "sections are sent with 4 bits per block");
 
 enum : uint32_t {
     SALT_CONT = 0x1001, SALT_TEMP = 0x2002, SALT_MTN = 0x3003, SALT_DETAIL = 0x4004,
@@ -30,7 +20,7 @@ enum : uint32_t {
 };
 
 static uint32_t g_seed;
-static int g_spawn_x, g_spawn_y, g_spawn_z;
+static BlockPos g_spawn{8, SEA_LEVEL + 1, 8};
 
 static uint32_t hash2(int x, int z, uint32_t salt) {
     uint32_t h = g_seed ^ salt;
@@ -41,7 +31,7 @@ static uint32_t hash2(int x, int z, uint32_t salt) {
     return h ^ (h >> 16);
 }
 
-static float grad(uint32_t h, float x, float z) {
+static constexpr float grad(uint32_t h, float x, float z) {
     switch (h & 7) {
         case 0:  return  x + z;
         case 1:  return  x - z;
@@ -54,8 +44,8 @@ static float grad(uint32_t h, float x, float z) {
     }
 }
 
-static float fade(float t) { return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f); }
-static float lerp(float a, float b, float t) { return a + (b - a) * t; }
+static constexpr float fade(float t) { return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f); }
+static constexpr float lerp(float a, float b, float t) { return a + (b - a) * t; }
 
 static float noise2(uint32_t salt, float x, float z) {
     float fx = floorf(x), fz = floorf(z);
@@ -81,19 +71,20 @@ static float fbm(uint32_t salt, float x, float z, int octaves) {
     return sum / norm;
 }
 
-static float smoothstep(float a, float b, float x) {
-    float t = (x - a) / (b - a);
-    t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+static constexpr float smoothstep(float a, float b, float x) {
+    float t = std::clamp((x - a) / (b - a), 0.0f, 1.0f);
     return t * t * (3.0f - 2.0f * t);
 }
 
 struct Column {
     int16_t h;
     Biome biome;
-    uint8_t top, under, plant;
+    Block top, under, plant;
 };
 
-static void column_at(int wx, int wz, Column& c) {
+using ChunkColumns = std::array<std::array<Column, 16>, 16>;
+
+static Column column_at(int wx, int wz) {
     float x = static_cast<float>(wx), z = static_cast<float>(wz);
     float cont   = fbm(SALT_CONT,   x / 384.0f, z / 384.0f, 4);
     float temp   = fbm(SALT_TEMP,   x / 512.0f, z / 512.0f, 3);
@@ -106,212 +97,180 @@ static void column_at(int wx, int wz, Column& c) {
     if (hills > 0.0f)
         hf += hills * (16.0f + 10.0f * fbm(SALT_PEAK, x / 64.0f, z / 64.0f, 2));
 
-    int h = static_cast<int>(floorf(hf));
-    if (h < MIN_Y + 1) h = MIN_Y + 1;
-    if (h > MIN_Y + NUM_SECTIONS * 16 - 16) h = MIN_Y + NUM_SECTIONS * 16 - 16;
-    c.h = static_cast<int16_t>(h);
+    int h = std::clamp(static_cast<int>(floorf(hf)), MIN_Y + 1, MIN_Y + NUM_SECTIONS * 16 - 16);
+    Column c{.h = static_cast<int16_t>(h), .biome = Biome::Plains,
+             .top = Block::Grass, .under = Block::Dirt, .plant = Block::Air};
 
-    if (h < SEA_LEVEL && land < 0.5f) c.biome = BIOME_OCEAN;
-    else if (hills > 0.5f)            c.biome = BIOME_HILLS;
-    else if (temp < -0.1f)            c.biome = BIOME_TAIGA;
-    else                              c.biome = BIOME_PLAINS;
+    if (h < SEA_LEVEL && land < 0.5f) c.biome = Biome::Ocean;
+    else if (hills > 0.5f)            c.biome = Biome::Hills;
+    else if (temp < -0.1f)            c.biome = Biome::Taiga;
 
     uint32_t r = hash2(wx, wz, SALT_DECOR);
-    c.plant = B_AIR;
-    c.under = B_DIRT;
     if (h < SEA_LEVEL) {
-        c.top = c.under = (h < SEA_LEVEL - 5) ? B_GRAVEL : B_SAND;
+        c.top = c.under = (h < SEA_LEVEL - 5) ? Block::Gravel : Block::Sand;
     } else if (h <= SEA_LEVEL + 1 && land < 0.9f) {
-        c.top = c.under = B_SAND;
-    } else if (c.biome == BIOME_HILLS && h > SEA_LEVEL + 30) {
-        c.top = B_SNOW;
-        c.under = B_STONE;
-    } else if (c.biome == BIOME_HILLS && h > SEA_LEVEL + 16) {
-        c.top = ((r & 15) == 0) ? B_GRAVEL : B_STONE;
-        c.under = B_STONE;
-    } else if (c.biome == BIOME_TAIGA) {
-        c.top = (((r >> 8) & 3) == 0) ? B_PODZOL : B_GRASS;
-        if ((r & 7) < 2) c.plant = B_FERN;
-        else if ((r & 7) == 2) c.plant = B_SHORT_GRASS;
-    } else {
-        c.top = B_GRASS;
-        if ((r & 7) < (c.biome == BIOME_PLAINS ? 3u : 1u)) c.plant = B_SHORT_GRASS;
+        c.top = c.under = Block::Sand;
+    } else if (c.biome == Biome::Hills && h > SEA_LEVEL + 30) {
+        c.top = Block::Snow;
+        c.under = Block::Stone;
+    } else if (c.biome == Biome::Hills && h > SEA_LEVEL + 16) {
+        c.top = ((r & 15) == 0) ? Block::Gravel : Block::Stone;
+        c.under = Block::Stone;
+    } else if (c.biome == Biome::Taiga) {
+        c.top = (((r >> 8) & 3) == 0) ? Block::Podzol : Block::Grass;
+        if ((r & 7) < 2) c.plant = Block::Fern;
+        else if ((r & 7) == 2) c.plant = Block::ShortGrass;
+    } else if ((r & 7) < (c.biome == Biome::Plains ? 3u : 1u)) {
+        c.plant = Block::ShortGrass;
     }
+    return c;
 }
 
 static int tree_height(int wx, int wz, const Column& c) {
     uint32_t r = hash2(wx, wz, SALT_TREE);
     if (r % 14 != 0) return 0;
-    if (c.h < SEA_LEVEL + 1 || (c.top != B_GRASS && c.top != B_PODZOL)) return 0;
+    if (c.h < SEA_LEVEL + 1 || (c.top != Block::Grass && c.top != Block::Podzol)) return 0;
     uint32_t r2 = r / 14;
-    if (c.biome == BIOME_TAIGA) return 6 + static_cast<int>((r2 >> 4) % 3);
-    if (c.biome == BIOME_PLAINS && r2 % 6 == 0) return 4 + static_cast<int>((r2 >> 4) & 1);
-    if (c.biome == BIOME_HILLS && r2 % 10 == 0) return 4 + static_cast<int>((r2 >> 4) & 1);
-    return 0;
+    switch (c.biome) {
+        case Biome::Taiga:  return 6 + static_cast<int>((r2 >> 4) % 3);
+        case Biome::Plains: return r2 % 6 == 0 ? 4 + static_cast<int>((r2 >> 4) & 1) : 0;
+        case Biome::Hills:  return r2 % 10 == 0 ? 4 + static_cast<int>((r2 >> 4) & 1) : 0;
+        default:            return 0;
+    }
 }
 
-static bool is_plant(uint8_t b) { return b == B_SHORT_GRASS || b == B_FERN; }
+static constexpr bool is_plant(Block b) { return b == Block::ShortGrass || b == Block::Fern; }
 
-static void put(ChunkScratch& w, int lx, int y, int lz, uint8_t b, bool force) {
+static constexpr bool is_opaque(Block b) {
+    return b != Block::Air && b != Block::Water && b != Block::OakLeaves && b != Block::SpruceLeaves && !is_plant(b);
+}
+
+static void put(ChunkScratch& w, int lx, int y, int lz, Block b, bool force) {
     if (lx < 0 || lx > 15 || lz < 0 || lz > 15) return;
     int yi = y - MIN_Y;
     if (yi < 0 || yi >= NUM_SECTIONS * 16) return;
-    uint8_t& cur = w.blocks[lx + lz * 16 + yi * 256];
-    if (force || cur == B_AIR || is_plant(cur)) cur = b;
+    Block& cur = w.blocks[lx + lz * 16 + yi * 256];
+    if (force || cur == Block::Air || is_plant(cur)) cur = b;
 }
 
-static void leaf_layer(ChunkScratch& w, int lx, int y, int lz, int r, uint8_t leaf) {
+static void leaf_layer(ChunkScratch& w, int lx, int y, int lz, int r, Block leaf) {
     for (int dx = -r; dx <= r; dx++)
         for (int dz = -r; dz <= r; dz++) {
-            if (r == 2 && abs(dx) == 2 && abs(dz) == 2) continue;
-            if (r == 1 && abs(dx) == 1 && abs(dz) == 1 && (y & 1)) continue;
+            if (r == 2 && std::abs(dx) == 2 && std::abs(dz) == 2) continue;
+            if (r == 1 && std::abs(dx) == 1 && std::abs(dz) == 1 && (y & 1)) continue;
             put(w, lx + dx, y, lz + dz, leaf, false);
         }
 }
 
 static void stamp_tree(ChunkScratch& w, int lx, int lz, int ground, int height, Biome biome) {
     int base = ground + 1;
-    if (biome == BIOME_TAIGA) {
+    if (biome == Biome::Taiga) {
         for (int dy = 2; dy <= height; dy++) {
             int k = height - dy;
             int r = (k == 0) ? 0 : (k % 2 == 1 ? 1 : 2);
-            leaf_layer(w, lx, base + dy, lz, r, B_SPRUCE_LEAVES);
+            leaf_layer(w, lx, base + dy, lz, r, Block::SpruceLeaves);
         }
-        put(w, lx, base + height + 1, lz, B_SPRUCE_LEAVES, false);
-        for (int dy = 0; dy < height; dy++) put(w, lx, base + dy, lz, B_SPRUCE_LOG, true);
+        put(w, lx, base + height + 1, lz, Block::SpruceLeaves, false);
+        for (int dy = 0; dy < height; dy++) put(w, lx, base + dy, lz, Block::SpruceLog, true);
     } else {
-        leaf_layer(w, lx, base + height - 2, lz, 2, B_OAK_LEAVES);
-        leaf_layer(w, lx, base + height - 1, lz, 2, B_OAK_LEAVES);
-        leaf_layer(w, lx, base + height, lz, 1, B_OAK_LEAVES);
-        put(w, lx, base + height + 1, lz, B_OAK_LEAVES, false);
-        for (int dy = 0; dy < height; dy++) put(w, lx, base + dy, lz, B_OAK_LOG, true);
+        leaf_layer(w, lx, base + height - 2, lz, 2, Block::OakLeaves);
+        leaf_layer(w, lx, base + height - 1, lz, 2, Block::OakLeaves);
+        leaf_layer(w, lx, base + height, lz, 1, Block::OakLeaves);
+        put(w, lx, base + height + 1, lz, Block::OakLeaves, false);
+        for (int dy = 0; dy < height; dy++) put(w, lx, base + dy, lz, Block::OakLog, true);
     }
 }
 
 void world_init(uint32_t seed) {
     g_seed = seed;
-    g_spawn_x = 8;
-    g_spawn_z = 8;
-    g_spawn_y = SEA_LEVEL + 1;
+    g_spawn = {8, SEA_LEVEL + 1, 8};
 
     for (int ring = 0; ring <= 64; ring++)
         for (int dx = -ring; dx <= ring; dx++)
             for (int dz = -ring; dz <= ring; dz++) {
-                if (abs(dx) != ring && abs(dz) != ring) continue;
+                if (std::abs(dx) != ring && std::abs(dz) != ring) continue;
                 int x = dx * 16 + 8, z = dz * 16 + 8;
-                Column c;
-                column_at(x, z, c);
-                if (c.h >= SEA_LEVEL + 1 && c.top == B_GRASS && tree_height(x, z, c) == 0) {
-                    g_spawn_x = x;
-                    g_spawn_z = z;
-                    g_spawn_y = c.h + 1;
+                Column c = column_at(x, z);
+                if (c.h >= SEA_LEVEL + 1 && c.top == Block::Grass && tree_height(x, z, c) == 0) {
+                    g_spawn = {x, c.h + 1, z};
                     return;
                 }
             }
 }
 
 uint32_t world_seed() { return g_seed; }
+BlockPos world_spawn() { return g_spawn; }
+Biome world_biome_at(int x, int z) { return column_at(x, z).biome; }
+int world_height_at(int x, int z) { return column_at(x, z).h; }
 
-void world_spawn(int& x, int& y, int& z) {
-    x = g_spawn_x;
-    y = g_spawn_y;
-    z = g_spawn_z;
-}
+struct BiomeBytes {
+    std::array<uint8_t, 32> buf{};
+    size_t size = 0;
+    std::span<const uint8_t> bytes() const { return {buf.data(), size}; }
+};
 
-Biome world_biome_at(int x, int z) {
-    Column c;
-    column_at(x, z, c);
-    return c.biome;
-}
-
-int world_height_at(int x, int z) {
-    Column c;
-    column_at(x, z, c);
-    return c.h;
-}
-
-bool ChunkScratch::init() {
-    blocks = static_cast<uint8_t*>(heap_caps_malloc(NUM_SECTIONS * 4096, MALLOC_CAP_SPIRAM));
-    light = static_cast<uint8_t*>(heap_caps_malloc(NUM_SECTIONS * 2048, MALLOC_CAP_SPIRAM));
-    return blocks && light && sections.init(16384);
-}
-
-void ChunkScratch::free() {
-    if (blocks) { heap_caps_free(blocks); blocks = nullptr; }
-    if (light) { heap_caps_free(light); light = nullptr; }
-    sections.free();
-}
-
-static bool is_opaque(uint8_t b) {
-    return b != B_AIR && b != B_WATER && b != B_OAK_LEAVES && b != B_SPRUCE_LEAVES && !is_plant(b);
-}
-
-static size_t encode_biomes(uint8_t* buf, const Column cols[16][16]) {
-    int ids[BIOME_COUNT];
-    int n = 0;
-    uint8_t cell_idx[16];
+static BiomeBytes encode_biomes(const ChunkColumns& cols) {
+    std::array<uint8_t, BIOMES.size()> ids{};
+    size_t n = 0;
+    std::array<uint8_t, 16> cell_idx{};
     for (int qz = 0; qz < 4; qz++)
         for (int qx = 0; qx < 4; qx++) {
-            int b = cols[qx * 4 + 2][qz * 4 + 2].biome;
-            int i = 0;
-            while (i < n && ids[i] != b) i++;
-            if (i == n) ids[n++] = b;
-            cell_idx[qx + qz * 4] = static_cast<uint8_t>(i);
+            auto b = std::to_underlying(cols[qx * 4 + 2][qz * 4 + 2].biome);
+            auto it = std::ranges::find(ids.begin(), ids.begin() + n, b);
+            if (it == ids.begin() + n) ids[n++] = b;
+            cell_idx[qx + qz * 4] = static_cast<uint8_t>(it - ids.begin());
         }
 
-    size_t p = 0;
+    BiomeBytes out;
+    auto push = [&](uint8_t v) { out.buf[out.size++] = v; };
     if (n == 1) {
-        buf[p++] = 0;
-        buf[p++] = static_cast<uint8_t>(ids[0]);
-        buf[p++] = 0;
-        return p;
+        push(0);
+        push(ids[0]);
+        push(0);
+        return out;
     }
 
     int bpe = (n <= 2) ? 1 : 2;
     int per_long = 64 / bpe;
     int nlongs = (64 + per_long - 1) / per_long;
-    int64_t longs[2] = {0, 0};
+    std::array<int64_t, 2> longs{};
     for (int i = 0; i < 64; i++) {
         int cell = (i % 4) + ((i / 4) % 4) * 4;
         longs[i / per_long] |= static_cast<int64_t>(cell_idx[cell]) << ((i % per_long) * bpe);
     }
-    buf[p++] = static_cast<uint8_t>(bpe);
-    buf[p++] = static_cast<uint8_t>(n);
-    for (int i = 0; i < n; i++) buf[p++] = static_cast<uint8_t>(ids[i]);
-    buf[p++] = static_cast<uint8_t>(nlongs);
-    for (int i = 0; i < nlongs; i++) {
-        mc_write_i64(buf + p, longs[i]);
-        p += 8;
-    }
-    return p;
+    push(static_cast<uint8_t>(bpe));
+    push(static_cast<uint8_t>(n));
+    for (size_t i = 0; i < n; i++) push(ids[i]);
+    push(static_cast<uint8_t>(nlongs));
+    for (int i = 0; i < nlongs; i++)
+        for (uint8_t byte : to_be(longs[i])) push(byte);
+    return out;
 }
 
 void world_encode_chunk(PacketBuf& out, ChunkScratch& w, int cx, int cz) {
-    Column cols[16][16];
+    ChunkColumns cols;
     int top_y = SEA_LEVEL;
     for (int x = 0; x < 16; x++)
         for (int z = 0; z < 16; z++) {
-            column_at(cx * 16 + x, cz * 16 + z, cols[x][z]);
-            if (cols[x][z].h > top_y) top_y = cols[x][z].h;
+            cols[x][z] = column_at(cx * 16 + x, cz * 16 + z);
+            top_y = std::max<int>(top_y, cols[x][z].h);
         }
-    top_y += 11;
-    int top_sec = (top_y - MIN_Y) / 16;
-    if (top_sec > NUM_SECTIONS - 1) top_sec = NUM_SECTIONS - 1;
+    int top_sec = std::min((top_y + 11 - MIN_Y) / 16, NUM_SECTIONS - 1);
     int ny = (top_sec + 1) * 16;
 
-    memset(w.blocks, B_AIR, ny * 256);
+    Block* blocks = w.blocks.get();
+    std::fill_n(blocks, ny * 256, Block::Air);
     for (int x = 0; x < 16; x++)
         for (int z = 0; z < 16; z++) {
             const Column& c = cols[x][z];
             for (int y = MIN_Y; y <= c.h; y++) {
                 int depth = c.h - y;
-                uint8_t b = (depth == 0) ? c.top : (depth <= 3 ? c.under : static_cast<uint8_t>(B_STONE));
-                w.blocks[x + z * 16 + (y - MIN_Y) * 256] = b;
+                blocks[x + z * 16 + (y - MIN_Y) * 256] = (depth == 0) ? c.top : (depth <= 3 ? c.under : Block::Stone);
             }
             for (int y = c.h + 1; y <= SEA_LEVEL; y++)
-                w.blocks[x + z * 16 + (y - MIN_Y) * 256] = B_WATER;
-            if (c.h >= SEA_LEVEL && c.plant != B_AIR)
-                w.blocks[x + z * 16 + (c.h + 1 - MIN_Y) * 256] = c.plant;
+                blocks[x + z * 16 + (y - MIN_Y) * 256] = Block::Water;
+            if (c.h >= SEA_LEVEL && c.plant != Block::Air)
+                blocks[x + z * 16 + (c.h + 1 - MIN_Y) * 256] = c.plant;
         }
 
     // Trees from neighbouring chunks can hang over the edge, so scan a 2-block border
@@ -319,72 +278,66 @@ void world_encode_chunk(PacketBuf& out, ChunkScratch& w, int cx, int cz) {
         for (int wz = cz * 16 - 2; wz < cz * 16 + 18; wz++) {
             if (hash2(wx, wz, SALT_TREE) % 14 != 0) continue;
             int lx = wx - cx * 16, lz = wz - cz * 16;
-            Column c;
-            if (lx >= 0 && lx < 16 && lz >= 0 && lz < 16) c = cols[lx][lz];
-            else column_at(wx, wz, c);
-            int th = tree_height(wx, wz, c);
-            if (th > 0) stamp_tree(w, lx, lz, c.h, th, c.biome);
+            bool inside = lx >= 0 && lx < 16 && lz >= 0 && lz < 16;
+            Column c = inside ? cols[lx][lz] : column_at(wx, wz);
+            if (int th = tree_height(wx, wz, c); th > 0) stamp_tree(w, lx, lz, c.h, th, c.biome);
         }
 
-    int64_t hm_longs[37];
-    memset(hm_longs, 0, sizeof(hm_longs));
-    memset(w.light, 0, (top_sec + 1) * 2048);
+    std::array<int64_t, 37> hm_longs{};
+    uint8_t* light = w.light.get();
+    std::fill_n(light, (top_sec + 1) * 2048, 0);
     for (int x = 0; x < 16; x++)
         for (int z = 0; z < 16; z++) {
-            int light = 15, hm = 0;
+            int sky = 15, hm = 0;
             for (int yi = ny - 1; yi >= 0; yi--) {
-                uint8_t b = w.blocks[x + z * 16 + yi * 256];
-                if (hm == 0 && b != B_AIR && !is_plant(b)) hm = yi + 1;
-                if (is_opaque(b)) light = 0;
-                else if (b != B_AIR && !is_plant(b) && light > 0) light--;
+                Block b = blocks[x + z * 16 + yi * 256];
+                if (hm == 0 && b != Block::Air && !is_plant(b)) hm = yi + 1;
+                if (is_opaque(b)) sky = 0;
+                else if (b != Block::Air && !is_plant(b) && sky > 0) sky--;
                 int idx = x + z * 16 + (yi & 15) * 256;
-                w.light[(yi >> 4) * 2048 + idx / 2] |= static_cast<uint8_t>(light << ((idx & 1) * 4));
+                light[(yi >> 4) * 2048 + idx / 2] |= static_cast<uint8_t>(sky << ((idx & 1) * 4));
             }
             int col = x + z * 16;
             hm_longs[col / 7] |= static_cast<int64_t>(hm & 0x1FF) << ((col % 7) * 9);
         }
 
-    uint8_t biome_bytes[32];
-    size_t biome_len = encode_biomes(biome_bytes, cols);
+    BiomeBytes biomes = encode_biomes(cols);
 
     PacketBuf& sec = w.sections;
     sec.reset();
     for (int s = 0; s < NUM_SECTIONS; s++) {
-        int count = 0;
-        const uint8_t* blk = w.blocks + s * 4096;
-        if (s <= top_sec)
-            for (int i = 0; i < 4096; i++) count += (blk[i] != B_AIR);
+        std::span<const Block> blk(blocks + s * 4096, 4096);
+        auto count = s <= top_sec ? std::ranges::count_if(blk, [](Block b) { return b != Block::Air; }) : 0;
 
         if (count == 0) {
             pkt_write_i16(sec, 0);
             pkt_write_byte(sec, 0);
-            pkt_write_varint(sec, PALETTE[B_AIR]);
+            pkt_write_varint(sec, PALETTE[std::to_underlying(Block::Air)]);
             pkt_write_varint(sec, 0);
         } else {
             pkt_write_i16(sec, static_cast<int16_t>(count));
             pkt_write_byte(sec, 4);
-            pkt_write_varint(sec, B_PALETTE_SIZE);
-            for (int i = 0; i < B_PALETTE_SIZE; i++) pkt_write_varint(sec, PALETTE[i]);
+            pkt_write_varint(sec, static_cast<int32_t>(PALETTE.size()));
+            for (int32_t state : PALETTE) pkt_write_varint(sec, state);
             pkt_write_varint(sec, 256);
             for (int l = 0; l < 256; l++) {
                 int64_t v = 0;
                 for (int k = 0; k < 16; k++)
-                    v |= static_cast<int64_t>(blk[l * 16 + k] & 0xF) << (k * 4);
+                    v |= static_cast<int64_t>(std::to_underlying(blk[l * 16 + k]) & 0xF) << (k * 4);
                 pkt_write_i64(sec, v);
             }
         }
-        sec.append(biome_bytes, biome_len);
+        sec.append(biomes.bytes());
     }
 
-    out.reset();
-    pkt_write_varint(out, 0x28);
+    pkt_begin(out, PlayOut::ChunkData);
     pkt_write_i32(out, cx);
     pkt_write_i32(out, cz);
     nbt_begin(out);
-    nbt_long_array(out, "MOTION_BLOCKING", hm_longs, 37);
+    nbt_long_array(out, "MOTION_BLOCKING", hm_longs);
     nbt_end(out);
     pkt_write_varint(out, static_cast<int32_t>(sec.len));
-    out.append(sec.data, sec.len);
+    out.append(sec.bytes());
     pkt_write_varint(out, 0);
 
     // Light sections are offset by one from chunk sections (index 0 is below the world).
@@ -400,7 +353,7 @@ void world_encode_chunk(PacketBuf& out, ChunkScratch& w, int cx, int cz) {
     pkt_write_varint(out, top_sec + 1);
     for (int s = 0; s <= top_sec; s++) {
         pkt_write_varint(out, 2048);
-        out.append(w.light + s * 2048, 2048);
+        out.append({light + s * 2048, 2048});
     }
     pkt_write_varint(out, 0);
 }

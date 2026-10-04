@@ -1,36 +1,54 @@
 #pragma once
 
-#include "mc_packet.h"
+#include <array>
 #include <cstdint>
+#include <string_view>
+#include <utility>
+#include "mc_packet.h"
 
-static constexpr int SEA_LEVEL = -52;
-static constexpr int MIN_Y = -64;
-static constexpr int NUM_SECTIONS = 24;
+inline constexpr int SEA_LEVEL = -52;
+inline constexpr int MIN_Y = -64;
+inline constexpr int NUM_SECTIONS = 24;
 
-// Order matters: the index is the biome's registry id sent to the client
-enum Biome : uint8_t { BIOME_PLAINS, BIOME_TAIGA, BIOME_OCEAN, BIOME_HILLS, BIOME_COUNT };
+enum class Biome : uint8_t { Plains, Taiga, Ocean, Hills };
 
 struct BiomeInfo {
-    const char* id;
+    std::string_view id;
     float temperature;
     float downfall;
     int32_t sky_color;
 };
 
-extern const BiomeInfo BIOMES[BIOME_COUNT];
+// The index is the registry id the client sees, so this follows the Biome order
+inline constexpr std::array<BiomeInfo, 4> BIOMES{{
+    {"minecraft:plains",          0.8f,  0.4f, 7907327},
+    {"minecraft:taiga",           0.25f, 0.8f, 8233983},
+    {"minecraft:ocean",           0.5f,  0.5f, 8103167},
+    {"minecraft:windswept_hills", 0.2f,  0.3f, 8233727},
+}};
+static_assert(BIOMES[std::to_underlying(Biome::Taiga)].id == "minecraft:taiga");
+static_assert(BIOMES[std::to_underlying(Biome::Hills)].id == "minecraft:windswept_hills");
+
+enum class Block : uint8_t {
+    Air, Stone, Dirt, Grass, Water, OakLog, OakLeaves, ShortGrass,
+    Sand, SpruceLog, SpruceLeaves, Fern, Podzol, Gravel, Snow,
+};
+
+struct BlockPos {
+    int x, y, z;
+};
 
 struct ChunkScratch {
-    uint8_t* blocks = nullptr;   // palette index per block, x + z*16 + (y - MIN_Y)*256
-    uint8_t* light = nullptr;
-    PacketBuf sections;
+    psram_ptr<Block> blocks = psram_alloc<Block>(NUM_SECTIONS * 4096);   // x + z*16 + (y - MIN_Y)*256
+    psram_ptr<uint8_t> light = psram_alloc<uint8_t>(NUM_SECTIONS * 2048);
+    PacketBuf sections{16384};
 
-    bool init();
-    void free();
+    bool ok() const { return blocks && light && sections.allocated(); }
 };
 
 void world_init(uint32_t seed);
 uint32_t world_seed();
-void world_spawn(int& x, int& y, int& z);
+BlockPos world_spawn();
 Biome world_biome_at(int x, int z);
 int world_height_at(int x, int z);
 

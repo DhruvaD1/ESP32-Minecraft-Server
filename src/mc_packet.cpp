@@ -1,73 +1,48 @@
 #include "mc_packet.h"
 #include "mc_types.h"
-#include "esp_heap_caps.h"
 #include "lwip/sockets.h"
-#include <cstring>
-
-bool PacketBuf::init(size_t initial_cap) {
-    data = static_cast<uint8_t*>(heap_caps_malloc(initial_cap, MALLOC_CAP_SPIRAM));
-    cap = data ? initial_cap : 0;
-    len = 0;
-    pos = 0;
-    err = (data == nullptr);
-    return data != nullptr;
-}
-
-void PacketBuf::free() {
-    if (data) { heap_caps_free(data); data = nullptr; }
-    cap = len = pos = 0;
-}
-
-void PacketBuf::reset() {
-    len = 0;
-    pos = 0;
-    err = false;
-}
+#include <algorithm>
 
 bool PacketBuf::ensure(size_t additional) {
-    if (len + additional <= cap) return true;
-    size_t new_cap = cap ? cap * 2 : 256;
+    if (len + additional <= cap_) return true;
+    size_t new_cap = cap_ ? cap_ * 2 : 256;
     while (new_cap < len + additional) new_cap *= 2;
-    auto* new_buf = static_cast<uint8_t*>(heap_caps_malloc(new_cap, MALLOC_CAP_SPIRAM));
-    if (!new_buf) { err = true; return false; }
-    if (data) {
-        std::memcpy(new_buf, data, len);
-        heap_caps_free(data);
+    auto bigger = psram_alloc<uint8_t>(new_cap);
+    if (!bigger) {
+        err = true;
+        return false;
     }
-    data = new_buf;
-    cap = new_cap;
+    std::ranges::copy(bytes(), bigger.get());
+    buf_ = std::move(bigger);
+    cap_ = new_cap;
     return true;
 }
 
-void PacketBuf::append(const uint8_t* src, size_t n) {
-    if (!ensure(n)) return;
-    std::memcpy(data + len, src, n);
-    len += n;
+void PacketBuf::append(std::span<const uint8_t> src) {
+    if (!ensure(src.size())) return;
+    std::ranges::copy(src, buf_.get() + len);
+    len += src.size();
 }
 
 void PacketBuf::frame_into(PacketBuf& dst) const {
-    uint8_t hdr[5];
-    int hdr_len = mc_write_varint(hdr, static_cast<int32_t>(len));
-    dst.append(hdr, hdr_len);
-    dst.append(data, len);
+    pkt_write_varint(dst, static_cast<int32_t>(len));
+    dst.append(bytes());
 }
 
-static bool recv_exact(int sock, uint8_t* buf, size_t n) {
-    size_t got = 0;
-    while (got < n) {
-        int r = recv(sock, buf + got, n - got, 0);
+static bool recv_exact(int sock, std::span<uint8_t> out) {
+    while (!out.empty()) {
+        int r = recv(sock, out.data(), out.size(), 0);
         if (r <= 0) return false;
-        got += r;
+        out = out.subspan(r);
     }
     return true;
 }
 
-bool send_all(int sock, const uint8_t* data, size_t n) {
-    size_t sent = 0;
-    while (sent < n) {
-        int r = send(sock, data + sent, n - sent, 0);
+bool send_all(int sock, std::span<const uint8_t> data) {
+    while (!data.empty()) {
+        int r = send(sock, data.data(), data.size(), 0);
         if (r <= 0) return false;
-        sent += r;
+        data = data.subspan(r);
     }
     return true;
 }
@@ -80,15 +55,13 @@ bool PacketBuf::recv_packet(int sock) {
         return false;
 
     if (!ensure(pkt_len)) return false;
-    if (!recv_exact(sock, data, pkt_len)) return false;
+    if (!recv_exact(sock, {buf_.get(), static_cast<size_t>(pkt_len)})) return false;
     len = pkt_len;
-    pos = 0;
     return true;
 }
 
 bool PacketBuf::send_packet(int sock) {
     if (err) return false;
-    uint8_t hdr[5];
-    int hdr_len = mc_write_varint(hdr, static_cast<int32_t>(len));
-    return send_all(sock, hdr, hdr_len) && send_all(sock, data, len);
+    auto hdr = encode_varint(static_cast<int32_t>(len));
+    return send_all(sock, hdr.bytes()) && send_all(sock, bytes());
 }

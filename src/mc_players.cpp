@@ -1,47 +1,58 @@
 #include "mc_players.h"
 #include "mc_packet.h"
-#include "mc_types.h"
 #include "mc_nbt.h"
+#include "mc_protocol.h"
 #include "mc_world.h"
 #include "config.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
-#include <cstring>
-#include <strings.h>
-#include <utility>
+#include <memory>
+#include <mutex>
+#include <ranges>
+#include <span>
 
-static const char* TAG = "mc_players";
+static constexpr const char* TAG = "mc_players";
 static constexpr size_t QUEUE_LIMIT = 64 * 1024;
-static constexpr int PLAYER_ENTITY_TYPE = 147;
+static constexpr int32_t PLAYER_ENTITY_TYPE = 147;
+
+// A FreeRTOS mutex for std::scoped_lock, and a player table that's built in place and
+// never destroyed: std::mutex and a static destructor drag ~7 KB of libstdc++ into flash.
+class RtosMutex {
+    StaticSemaphore_t storage_;
+    SemaphoreHandle_t handle_ = xSemaphoreCreateMutexStatic(&storage_);
+
+public:
+    void lock() { xSemaphoreTake(handle_, portMAX_DELAY); }
+    void unlock() { xSemaphoreGive(handle_); }
+};
 
 struct Player {
-    bool used, in_play, overflow;
-    int32_t eid;
-    uint64_t uuid_hi, uuid_lo;
-    char name[17];
-    double x, y, z;
-    float yaw, pitch;
-    bool on_ground;
+    bool used = false, in_play = false, overflow = false;
+    int32_t eid = 0;
+    Uuid uuid;
+    std::array<char, 17> name{};
+    Vec3d pos{};
+    Rotation rot{};
+    bool on_ground = false;
     PacketBuf queue, spare, build;
+
+    std::string_view name_view() const { return name.data(); }
 };
 
 // Other tasks only ever append to a player's queue under g_lock. The owning
 // task drains it in players_flush, so it's the only one writing to its socket.
-static Player g_players[MC_MAX_PLAYERS];
-static SemaphoreHandle_t g_lock;
+using PlayerTable = std::array<Player, MC_MAX_PLAYERS>;
+alignas(PlayerTable) static std::byte g_player_storage[sizeof(PlayerTable)];
+static PlayerTable& g_players = *std::construct_at(reinterpret_cast<PlayerTable*>(g_player_storage));
+static RtosMutex g_lock;
 static int32_t g_next_eid = 1;
-
-struct Guard {
-    Guard() { xSemaphoreTake(g_lock, portMAX_DELAY); }
-    ~Guard() { xSemaphoreGive(g_lock); }
-};
-
-void players_init() {
-    g_lock = xSemaphoreCreateMutex();
-}
 
 static uint8_t angle(float deg) {
     return static_cast<uint8_t>(static_cast<int>(floorf(deg * 256.0f / 360.0f)) & 0xFF);
@@ -57,19 +68,18 @@ static void enqueue(Player& p, const PacketBuf& pkt) {
     if (p.queue.err) p.overflow = true;
 }
 
-static void broadcast(const PacketBuf& pkt, int except) {
-    for (int i = 0; i < MC_MAX_PLAYERS; i++)
-        if (i != except) enqueue(g_players[i], pkt);
+static void broadcast(const PacketBuf& pkt, const Player* except) {
+    for (auto& p : g_players)
+        if (&p != except) enqueue(p, pkt);
 }
 
-static void write_info_add(PacketBuf& b, const Player* const* list, int n) {
-    b.reset();
-    pkt_write_varint(b, 0x40);
+static void write_info_add(PacketBuf& b, std::span<const Player* const> list) {
+    pkt_begin(b, PlayOut::PlayerInfoUpdate);
     pkt_write_byte(b, 0x01 | 0x04 | 0x08 | 0x10);
-    pkt_write_varint(b, n);
-    for (int i = 0; i < n; i++) {
-        pkt_write_uuid(b, list[i]->uuid_hi, list[i]->uuid_lo);
-        pkt_write_string(b, list[i]->name);
+    pkt_write_varint(b, static_cast<int32_t>(list.size()));
+    for (const Player* p : list) {
+        pkt_write_uuid(b, p->uuid);
+        pkt_write_string(b, p->name_view());
         pkt_write_varint(b, 0);
         pkt_write_varint(b, 1);
         pkt_write_bool(b, true);
@@ -78,17 +88,16 @@ static void write_info_add(PacketBuf& b, const Player* const* list, int n) {
 }
 
 static void write_spawn(PacketBuf& b, const Player& p) {
-    b.reset();
-    pkt_write_varint(b, 0x01);
+    pkt_begin(b, PlayOut::SpawnEntity);
     pkt_write_varint(b, p.eid);
-    pkt_write_uuid(b, p.uuid_hi, p.uuid_lo);
+    pkt_write_uuid(b, p.uuid);
     pkt_write_varint(b, PLAYER_ENTITY_TYPE);
-    pkt_write_f64(b, p.x);
-    pkt_write_f64(b, p.y);
-    pkt_write_f64(b, p.z);
-    pkt_write_byte(b, angle(p.pitch));
-    pkt_write_byte(b, angle(p.yaw));
-    pkt_write_byte(b, angle(p.yaw));
+    pkt_write_f64(b, p.pos.x);
+    pkt_write_f64(b, p.pos.y);
+    pkt_write_f64(b, p.pos.z);
+    pkt_write_byte(b, angle(p.rot.pitch));
+    pkt_write_byte(b, angle(p.rot.yaw));
+    pkt_write_byte(b, angle(p.rot.yaw));
     pkt_write_varint(b, 0);
     pkt_write_i16(b, 0);
     pkt_write_i16(b, 0);
@@ -96,146 +105,131 @@ static void write_spawn(PacketBuf& b, const Player& p) {
 }
 
 static void write_head(PacketBuf& b, const Player& p) {
-    b.reset();
-    pkt_write_varint(b, 0x4D);
+    pkt_begin(b, PlayOut::HeadRotation);
     pkt_write_varint(b, p.eid);
-    pkt_write_byte(b, angle(p.yaw));
+    pkt_write_byte(b, angle(p.rot.yaw));
 }
 
 static void write_sync(PacketBuf& b, const Player& p) {
-    b.reset();
-    pkt_write_varint(b, 0x20);
+    pkt_begin(b, PlayOut::SyncEntityPosition);
     pkt_write_varint(b, p.eid);
-    pkt_write_f64(b, p.x);
-    pkt_write_f64(b, p.y);
-    pkt_write_f64(b, p.z);
+    pkt_write_f64(b, p.pos.x);
+    pkt_write_f64(b, p.pos.y);
+    pkt_write_f64(b, p.pos.z);
     pkt_write_f64(b, 0.0);
     pkt_write_f64(b, 0.0);
     pkt_write_f64(b, 0.0);
-    pkt_write_f32(b, p.yaw);
-    pkt_write_f32(b, p.pitch);
+    pkt_write_f32(b, p.rot.yaw);
+    pkt_write_f32(b, p.rot.pitch);
     pkt_write_bool(b, p.on_ground);
 }
 
-static void write_chat(PacketBuf& b, const char* text, const char* color) {
-    b.reset();
-    pkt_write_varint(b, 0x73);
+static void write_chat(PacketBuf& b, std::string_view text, std::optional<std::string_view> color = {}) {
+    pkt_begin(b, PlayOut::SystemChat);
     nbt_begin(b);
     nbt_string(b, "text", text);
-    if (color) nbt_string(b, "color", color);
+    if (color) nbt_string(b, "color", *color);
     nbt_end(b);
     pkt_write_bool(b, false);
 }
 
 // The client decodes NBT strings as Java modified UTF-8, which has no 4-byte
 // sequences, so emoji and broken bytes become '?' instead of kicking everyone.
-static void sanitize(const char* in, char* out, size_t cap) {
-    const auto* s = reinterpret_cast<const uint8_t*>(in);
+static std::string_view sanitize(std::string_view in, std::span<char> out) {
     size_t o = 0;
-    while (*s && o + 4 < cap) {
-        uint8_t c = *s;
-        int n = (c < 0x80) ? 1 : ((c >> 5) == 0x6) ? 2 : ((c >> 4) == 0xE) ? 3 : ((c >> 3) == 0x1E) ? 4 : 0;
-        bool ok = n > 0 && !(n == 1 && c < 0x20);
-        for (int k = 1; ok && k < n; k++) ok = (s[k] & 0xC0) == 0x80;
+    size_t i = 0;
+    while (i < in.size() && o + 4 < out.size()) {
+        auto c = static_cast<uint8_t>(in[i]);
+        size_t n = (c < 0x80) ? 1 : ((c >> 5) == 0x6) ? 2 : ((c >> 4) == 0xE) ? 3 : ((c >> 3) == 0x1E) ? 4 : 0;
+        bool ok = n > 0 && i + n <= in.size() && !(n == 1 && c < 0x20);
+        for (size_t k = 1; ok && k < n; k++) ok = (static_cast<uint8_t>(in[i + k]) & 0xC0) == 0x80;
         if (ok && n < 4) {
-            memcpy(out + o, s, n);
+            std::copy_n(in.data() + i, n, out.begin() + o);
             o += n;
         } else {
             out[o++] = '?';
         }
-        s += ok ? n : 1;
+        i += ok ? n : 1;
     }
-    out[o] = '\0';
+    return {out.data(), o};
 }
 
-int players_join(const char* name, uint64_t uuid_hi, uint64_t uuid_lo, const char*& reason) {
-    Guard g;
-    int slot = -1;
-    for (int i = 0; i < MC_MAX_PLAYERS; i++) {
-        const Player& p = g_players[i];
-        if (!p.used) {
-            if (slot < 0) slot = i;
-            continue;
-        }
-        if (strcasecmp(p.name, name) == 0 || (p.uuid_hi == uuid_hi && p.uuid_lo == uuid_lo)) {
-            reason = "That name is already online";
-            return -1;
-        }
-    }
-    if (slot < 0) {
-        reason = "Server is full";
-        return -1;
-    }
+std::expected<int, std::string_view> players_join(std::string_view name, Uuid uuid) {
+    std::scoped_lock lock(g_lock);
+    auto same = [&](const Player& p) {
+        return p.used && (p.uuid == uuid ||
+                          std::ranges::equal(p.name_view(), name, [](char a, char b) {
+                              return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
+                          }));
+    };
+    if (std::ranges::any_of(g_players, same)) return std::unexpected("That name is already online");
 
-    Player& p = g_players[slot];
-    if ((!p.queue.data && !p.queue.init(4096)) ||
-        (!p.spare.data && !p.spare.init(4096)) ||
-        (!p.build.data && !p.build.init(512))) {
-        reason = "Server is out of memory";
-        return -1;
-    }
+    auto it = std::ranges::find_if(g_players, [](const Player& p) { return !p.used; });
+    if (it == g_players.end()) return std::unexpected("Server is full");
 
-    int sx, sy, sz;
-    world_spawn(sx, sy, sz);
+    Player& p = *it;
+    for (PacketBuf* buf : {&p.queue, &p.spare, &p.build})
+        if (!buf->allocated()) *buf = PacketBuf(4096);
+    if (!p.queue.allocated() || !p.spare.allocated() || !p.build.allocated())
+        return std::unexpected("Server is out of memory");
+
+    auto [sx, sy, sz] = world_spawn();
     p.used = true;
     p.in_play = false;
     p.overflow = false;
     p.eid = g_next_eid++;
-    p.uuid_hi = uuid_hi;
-    p.uuid_lo = uuid_lo;
-    strncpy(p.name, name, sizeof(p.name) - 1);
-    p.name[sizeof(p.name) - 1] = '\0';
-    p.x = sx + 0.5;
-    p.y = sy;
-    p.z = sz + 0.5;
-    p.yaw = p.pitch = 0.0f;
+    p.uuid = uuid;
+    p.name.fill('\0');
+    std::copy_n(name.data(), std::min(name.size(), p.name.size() - 1), p.name.begin());
+    p.pos = {sx + 0.5, static_cast<double>(sy), sz + 0.5};
+    p.rot = {};
     p.on_ground = true;
     p.queue.reset();
     p.spare.reset();
-    return slot;
+    return static_cast<int>(it - g_players.begin());
 }
 
 int32_t players_eid(int slot) {
-    Guard g;
+    std::scoped_lock lock(g_lock);
     return g_players[slot].eid;
 }
 
 void players_enter_play(int slot) {
-    Guard g;
+    std::scoped_lock lock(g_lock);
     Player& me = g_players[slot];
     PacketBuf& b = me.build;
     me.in_play = true;
 
-    const Player* self[1] = {&me};
-    write_info_add(b, self, 1);
-    broadcast(b, slot);
+    const std::array<const Player*, 1> self{&me};
+    write_info_add(b, self);
+    broadcast(b, &me);
     write_spawn(b, me);
-    broadcast(b, slot);
+    broadcast(b, &me);
 
-    const Player* list[MC_MAX_PLAYERS];
-    int n = 0;
-    for (int i = 0; i < MC_MAX_PLAYERS; i++)
-        if (g_players[i].in_play) list[n++] = &g_players[i];
-    write_info_add(b, list, n);
+    std::array<const Player*, MC_MAX_PLAYERS> list{};
+    size_t n = 0;
+    for (const auto& p : g_players)
+        if (p.in_play) list[n++] = &p;
+    write_info_add(b, std::span(list).first(n));
     enqueue(me, b);
 
-    for (int i = 0; i < MC_MAX_PLAYERS; i++) {
-        if (i == slot || !g_players[i].in_play) continue;
-        write_spawn(b, g_players[i]);
+    for (const auto& other : g_players) {
+        if (&other == &me || !other.in_play) continue;
+        write_spawn(b, other);
         enqueue(me, b);
-        write_head(b, g_players[i]);
+        write_head(b, other);
         enqueue(me, b);
     }
 
     char text[64];
-    snprintf(text, sizeof(text), "%s joined the game", me.name);
-    write_chat(b, text, "yellow");
-    broadcast(b, -1);
-    ESP_LOGI(TAG, "%s joined (%d online)", me.name, n);
+    int len = snprintf(text, sizeof(text), "%s joined the game", me.name.data());
+    write_chat(b, {text, static_cast<size_t>(len)}, "yellow");
+    broadcast(b, nullptr);
+    ESP_LOGI(TAG, "%s joined (%d online)", me.name.data(), static_cast<int>(n));
 }
 
 void players_leave(int slot) {
-    Guard g;
+    std::scoped_lock lock(g_lock);
     Player& p = g_players[slot];
     if (!p.used) return;
     bool was_playing = p.in_play;
@@ -245,95 +239,85 @@ void players_leave(int slot) {
     if (!was_playing) return;
 
     PacketBuf& b = p.build;
-    b.reset();
-    pkt_write_varint(b, 0x47);
+    pkt_begin(b, PlayOut::RemoveEntities);
     pkt_write_varint(b, 1);
     pkt_write_varint(b, p.eid);
-    broadcast(b, slot);
+    broadcast(b, &p);
 
-    b.reset();
-    pkt_write_varint(b, 0x3F);
+    pkt_begin(b, PlayOut::PlayerInfoRemove);
     pkt_write_varint(b, 1);
-    pkt_write_uuid(b, p.uuid_hi, p.uuid_lo);
-    broadcast(b, slot);
+    pkt_write_uuid(b, p.uuid);
+    broadcast(b, &p);
 
     char text[64];
-    snprintf(text, sizeof(text), "%s left the game", p.name);
-    write_chat(b, text, "yellow");
-    broadcast(b, slot);
-    ESP_LOGI(TAG, "%s left", p.name);
+    int len = snprintf(text, sizeof(text), "%s left the game", p.name.data());
+    write_chat(b, {text, static_cast<size_t>(len)}, "yellow");
+    broadcast(b, &p);
+    ESP_LOGI(TAG, "%s left", p.name.data());
 }
 
-void players_move(int slot, const double* pos, const float* rot, bool on_ground) {
-    Guard g;
+void players_move(int slot, std::optional<Vec3d> pos, std::optional<Rotation> rot, bool on_ground) {
+    if (pos && !(std::isfinite(pos->x) && std::isfinite(pos->y) && std::isfinite(pos->z) &&
+                 std::fabs(pos->x) <= 3.0e7 && std::fabs(pos->y) <= 3.0e7 && std::fabs(pos->z) <= 3.0e7))
+        return;
+    if (rot && !(std::isfinite(rot->yaw) && std::isfinite(rot->pitch))) return;
+
+    std::scoped_lock lock(g_lock);
     Player& p = g_players[slot];
     if (!p.in_play) return;
-
-    if (pos) {
-        for (int i = 0; i < 3; i++)
-            if (!std::isfinite(pos[i]) || fabs(pos[i]) > 3.0e7) return;
-        p.x = pos[0];
-        p.y = pos[1];
-        p.z = pos[2];
-    }
-    if (rot) {
-        if (!std::isfinite(rot[0]) || !std::isfinite(rot[1])) return;
-        p.yaw = rot[0];
-        p.pitch = rot[1];
-    }
+    if (pos) p.pos = *pos;
+    if (rot) p.rot = *rot;
     p.on_ground = on_ground;
 
     write_sync(p.build, p);
-    broadcast(p.build, slot);
+    broadcast(p.build, &p);
     if (rot) {
         write_head(p.build, p);
-        broadcast(p.build, slot);
+        broadcast(p.build, &p);
     }
 }
 
-void players_chat(int slot, const char* msg) {
-    char clean[512];
-    sanitize(msg, clean, sizeof(clean));
+void players_chat(int slot, std::string_view msg) {
+    std::array<char, 512> clean;
+    std::string_view text_in = sanitize(msg, clean);
 
-    Guard g;
+    std::scoped_lock lock(g_lock);
     Player& p = g_players[slot];
     if (!p.in_play) return;
     char text[600];
-    snprintf(text, sizeof(text), "<%s> %s", p.name, clean);
-    write_chat(p.build, text, nullptr);
-    broadcast(p.build, -1);
-    ESP_LOGI(TAG, "%s", text);
+    int len = snprintf(text, sizeof(text), "<%s> %.*s", p.name.data(), static_cast<int>(text_in.size()), text_in.data());
+    std::string_view line(text, std::min<size_t>(len, sizeof(text) - 1));
+    write_chat(p.build, line);
+    broadcast(p.build, nullptr);
+    ESP_LOGI(TAG, "%.*s", static_cast<int>(line.size()), line.data());
 }
 
 void players_swing(int slot, int hand) {
-    Guard g;
+    std::scoped_lock lock(g_lock);
     Player& p = g_players[slot];
     if (!p.in_play) return;
     PacketBuf& b = p.build;
-    b.reset();
-    pkt_write_varint(b, 0x03);
+    pkt_begin(b, PlayOut::Animation);
     pkt_write_varint(b, p.eid);
     pkt_write_byte(b, hand == 1 ? 3 : 0);
-    broadcast(b, slot);
+    broadcast(b, &p);
 }
 
 bool players_flush(int slot, int sock) {
     Player& p = g_players[slot];
     {
-        Guard g;
+        std::scoped_lock lock(g_lock);
         if (p.overflow) return false;
         if (p.queue.len == 0) return true;
         std::swap(p.queue, p.spare);
         p.queue.reset();
     }
-    bool ok = send_all(sock, p.spare.data, p.spare.len);
+    bool ok = send_all(sock, p.spare.bytes());
     p.spare.reset();
     return ok;
 }
 
 int players_online() {
-    Guard g;
-    int n = 0;
-    for (int i = 0; i < MC_MAX_PLAYERS; i++) n += g_players[i].in_play;
-    return n;
+    std::scoped_lock lock(g_lock);
+    return static_cast<int>(std::ranges::count_if(g_players, &Player::in_play));
 }

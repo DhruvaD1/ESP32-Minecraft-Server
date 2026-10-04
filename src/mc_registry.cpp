@@ -2,19 +2,19 @@
 #include "mc_types.h"
 #include "mc_nbt.h"
 #include "mc_world.h"
+#include "mc_protocol.h"
 #include "esp_log.h"
-#include <cstring>
+#include <array>
+#include <string_view>
 
-static const char* TAG = "mc_registry";
+static constexpr const char* TAG = "mc_registry";
 
 struct DamageType {
-    const char* id;
-    const char* msg;
-    const char* scaling;
+    std::string_view id, msg, scaling;
     float exhaustion;
 };
 
-static const DamageType DAMAGE_TYPES[] = {
+static constexpr auto DAMAGE_TYPES = std::to_array<DamageType>({
     {"minecraft:arrow",              "arrow",            "when_caused_by_living_non_player", 0.1f},
     {"minecraft:bad_respawn_point",  "badRespawnPoint",  "always",                           0.1f},
     {"minecraft:cactus",             "cactus",           "when_caused_by_living_non_player", 0.1f},
@@ -64,13 +64,10 @@ static const DamageType DAMAGE_TYPES[] = {
     {"minecraft:wind_charge",        "mob",              "when_caused_by_living_non_player", 0.1f},
     {"minecraft:wither",             "wither",           "when_caused_by_living_non_player", 0.0f},
     {"minecraft:wither_skull",       "witherSkull",      "when_caused_by_living_non_player", 0.1f},
-};
-
-static constexpr int DAMAGE_TYPE_COUNT = sizeof(DAMAGE_TYPES) / sizeof(DAMAGE_TYPES[0]);
+});
 
 static void send_dimension_type(int sock, PacketBuf& out) {
-    out.reset();
-    pkt_write_varint(out, 0x07);
+    pkt_begin(out, ConfigOut::RegistryData);
     pkt_write_string(out, "minecraft:dimension_type");
     pkt_write_varint(out, 1);
 
@@ -101,20 +98,19 @@ static void send_dimension_type(int sock, PacketBuf& out) {
 }
 
 static void send_biome(int sock, PacketBuf& out) {
-    out.reset();
-    pkt_write_varint(out, 0x07);
+    pkt_begin(out, ConfigOut::RegistryData);
     pkt_write_string(out, "minecraft:worldgen/biome");
-    pkt_write_varint(out, BIOME_COUNT);
+    pkt_write_varint(out, static_cast<int32_t>(BIOMES.size()));
 
-    for (int i = 0; i < BIOME_COUNT; i++) {
-        pkt_write_string(out, BIOMES[i].id);
+    for (const auto& b : BIOMES) {
+        pkt_write_string(out, b.id);
         pkt_write_bool(out, true);
         nbt_begin(out);
         nbt_byte(out, "has_precipitation", 1);
-        nbt_float(out, "temperature", BIOMES[i].temperature);
-        nbt_float(out, "downfall", BIOMES[i].downfall);
+        nbt_float(out, "temperature", b.temperature);
+        nbt_float(out, "downfall", b.downfall);
         nbt_compound(out, "effects");
-        nbt_int(out, "sky_color", BIOMES[i].sky_color);
+        nbt_int(out, "sky_color", b.sky_color);
         nbt_int(out, "fog_color", 12638463);
         nbt_int(out, "water_color", 4159204);
         nbt_int(out, "water_fog_color", 329011);
@@ -123,30 +119,29 @@ static void send_biome(int sock, PacketBuf& out) {
     }
 
     out.send_packet(sock);
-    ESP_LOGI(TAG, "Sent %d biomes", BIOME_COUNT);
+    ESP_LOGI(TAG, "Sent %d biomes", static_cast<int>(BIOMES.size()));
 }
 
 static void send_chat_type(int sock, PacketBuf& out) {
-    out.reset();
-    pkt_write_varint(out, 0x07);
+    pkt_begin(out, ConfigOut::RegistryData);
     pkt_write_string(out, "minecraft:chat_type");
     pkt_write_varint(out, 1);
 
     pkt_write_string(out, "minecraft:chat");
     pkt_write_bool(out, true);
 
-    const char* params[] = {"sender", "content"};
+    constexpr std::array<std::string_view, 2> params{"sender", "content"};
 
     nbt_begin(out);
 
     nbt_compound(out, "chat");
     nbt_string(out, "translation_key", "chat.type.text");
-    nbt_string_list(out, "parameters", params, 2);
+    nbt_string_list(out, "parameters", params);
     nbt_end(out);
 
     nbt_compound(out, "narration");
     nbt_string(out, "translation_key", "chat.type.text.narrate");
-    nbt_string_list(out, "parameters", params, 2);
+    nbt_string_list(out, "parameters", params);
     nbt_end(out);
 
     nbt_end(out);
@@ -156,28 +151,26 @@ static void send_chat_type(int sock, PacketBuf& out) {
 }
 
 static void send_damage_type(int sock, PacketBuf& out) {
-    out.reset();
-    pkt_write_varint(out, 0x07);
+    pkt_begin(out, ConfigOut::RegistryData);
     pkt_write_string(out, "minecraft:damage_type");
-    pkt_write_varint(out, DAMAGE_TYPE_COUNT);
+    pkt_write_varint(out, static_cast<int32_t>(DAMAGE_TYPES.size()));
 
-    for (int i = 0; i < DAMAGE_TYPE_COUNT; i++) {
-        pkt_write_string(out, DAMAGE_TYPES[i].id);
+    for (const auto& d : DAMAGE_TYPES) {
+        pkt_write_string(out, d.id);
         pkt_write_bool(out, true);
         nbt_begin(out);
-        nbt_string(out, "message_id", DAMAGE_TYPES[i].msg);
-        nbt_string(out, "scaling", DAMAGE_TYPES[i].scaling);
-        nbt_float(out, "exhaustion", DAMAGE_TYPES[i].exhaustion);
+        nbt_string(out, "message_id", d.msg);
+        nbt_string(out, "scaling", d.scaling);
+        nbt_float(out, "exhaustion", d.exhaustion);
         nbt_end(out);
     }
 
     out.send_packet(sock);
-    ESP_LOGI(TAG, "Sent damage_type (%d entries)", DAMAGE_TYPE_COUNT);
+    ESP_LOGI(TAG, "Sent damage_type (%d entries)", static_cast<int>(DAMAGE_TYPES.size()));
 }
 
 static void send_painting_variant(int sock, PacketBuf& out) {
-    out.reset();
-    pkt_write_varint(out, 0x07);
+    pkt_begin(out, ConfigOut::RegistryData);
     pkt_write_string(out, "minecraft:painting_variant");
     pkt_write_varint(out, 1);
 
@@ -194,8 +187,7 @@ static void send_painting_variant(int sock, PacketBuf& out) {
 }
 
 static void send_wolf_variant(int sock, PacketBuf& out) {
-    out.reset();
-    pkt_write_varint(out, 0x07);
+    pkt_begin(out, ConfigOut::RegistryData);
     pkt_write_string(out, "minecraft:wolf_variant");
     pkt_write_varint(out, 1);
 
@@ -212,17 +204,15 @@ static void send_wolf_variant(int sock, PacketBuf& out) {
     ESP_LOGI(TAG, "Sent wolf_variant");
 }
 
-static void send_empty_registry(int sock, PacketBuf& out, const char* id) {
-    out.reset();
-    pkt_write_varint(out, 0x07);
+static void send_empty_registry(int sock, PacketBuf& out, std::string_view id) {
+    pkt_begin(out, ConfigOut::RegistryData);
     pkt_write_string(out, id);
     pkt_write_varint(out, 0);
     out.send_packet(sock);
 }
 
 void send_config_packets(int sock, PacketBuf& out) {
-    out.reset();
-    pkt_write_varint(out, 0x0E);
+    pkt_begin(out, ConfigOut::KnownPacks);
     pkt_write_varint(out, 0);
     out.send_packet(sock);
     ESP_LOGI(TAG, "Sent Known Packs (0 entries)");
@@ -234,24 +224,21 @@ void send_config_packets(int sock, PacketBuf& out) {
     send_painting_variant(sock, out);
     send_wolf_variant(sock, out);
 
-    send_empty_registry(sock, out, "minecraft:trim_pattern");
-    send_empty_registry(sock, out, "minecraft:trim_material");
-    send_empty_registry(sock, out, "minecraft:banner_pattern");
-    send_empty_registry(sock, out, "minecraft:enchantment");
-    send_empty_registry(sock, out, "minecraft:jukebox_song");
-    send_empty_registry(sock, out, "minecraft:instrument");
+    constexpr std::array<std::string_view, 6> empty_registries{
+        "minecraft:trim_pattern", "minecraft:trim_material", "minecraft:banner_pattern",
+        "minecraft:enchantment", "minecraft:jukebox_song", "minecraft:instrument",
+    };
+    for (auto id : empty_registries) send_empty_registry(sock, out, id);
 
     ESP_LOGI(TAG, "All registries sent");
 
-    out.reset();
-    pkt_write_varint(out, 0x0C);
+    pkt_begin(out, ConfigOut::FeatureFlags);
     pkt_write_varint(out, 1);
     pkt_write_string(out, "minecraft:vanilla");
     out.send_packet(sock);
     ESP_LOGI(TAG, "Sent Feature Flags");
 
-    out.reset();
-    pkt_write_varint(out, 0x03);
+    pkt_begin(out, ConfigOut::FinishConfiguration);
     out.send_packet(sock);
     ESP_LOGI(TAG, "Sent Finish Configuration");
 }
